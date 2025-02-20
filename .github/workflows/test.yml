@@ -1,0 +1,197 @@
+name: Build and Deploy Aseprite
+
+on:
+  # 来自第一个 Workflow 的触发条件
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches: [ "main" ]
+
+env:
+  BUILD_TYPE: Release  # 来自第一个 Workflow 的默认构建类型
+
+jobs:
+  check-version:
+    # 以下 check-version 部分完全来自第一个 Workflow
+    name: Check latest Aseprite release
+    runs-on: ubuntu-latest
+    outputs:
+      download_url: ${{ steps.version_info.outputs.download_url }}
+      latest_tag: ${{ steps.version_info.outputs.latest_tag }}
+      should_build: ${{ steps.should_build.outputs.should_build }}
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+
+    steps:
+    - name: Get latest version info
+      id: version_info
+      run: |
+        data=$(curl -sL https://api.github.com/repos/aseprite/aseprite/releases/latest)
+        LATEST_TAG=$(echo "${data}" | jq -r '.tag_name')
+        DOWNLOAD_URL=$(echo "${data}" | jq -r '.assets[].browser_download_url')
+        VERSION_INFO=$(echo "${data}" | jq -r '.body')
+        echo "latest_tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
+        echo "download_url=${DOWNLOAD_URL}" >> $GITHUB_OUTPUT
+        echo "version_info<<EOF" >> $GITHUB_OUTPUT
+        echo "$VERSION_INFO" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        echo "${LATEST_TAG}" > ${LATEST_TAG}.txt
+
+    - name: Exit if beta or rc tag
+      if: contains(steps.version_info.outputs.latest_tag, 'beta2') || contains(steps.version_info.outputs.latest_tag, 'rc')
+      run: |
+        echo "Detected 'beta' or 'rc' in the latest tag, skipping build."
+        exit 0
+
+    - name: Load version from cache
+      id: version_check
+      uses: actions/cache@v3
+      with:
+        path: ${{ steps.version_info.outputs.latest_tag }}.txt
+        key: cached_version
+    - name: Should we start new build?
+      id: should_build
+      if: steps.version_check.outputs.cache-hit != 'true'
+      run: echo "should_build=true" >> $GITHUB_OUTPUT
+    - name: Create Release
+      id: create_release
+      if: steps.should_build.outputs.should_build
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.version_info.outputs.latest_tag }}
+        release_name: Release Aseprite ${{ steps.version_info.outputs.latest_tag }}
+        body: |
+          ${{ steps.version_info.outputs.version_info }}
+        draft: false
+        prerelease: false
+
+  build-aseprite:
+    name: Build Aseprite
+    needs: check-version
+    if: ${{ needs.check-version.outputs.should_build }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 结合两个 Workflow 的矩阵策略
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        build_type: [RelWithDebInfo, Release]  # 来自第二个 Workflow 的构建类型
+        ui: [gui]  # 只保留 GUI 构建（来自第一个 Workflow 的需求）
+        scripting: [lua]  # 只保留脚本支持（来自第二个 Workflow 的配置）
+        exclude:
+          - build_type: RelWithDebInfo  # 排除不需要的组合
+            ui: gui
+      fail-fast: false
+
+    steps:
+      # 以下步骤主要来自第二个 Workflow，但做了必要调整
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install Dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+            libx11-dev libxcursor-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev
+
+      - name: Install Skia
+        if: ${{ matrix.ui == 'gui' }}
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]] ; then
+            choco install wget -y --no-progress
+            wget https://github.com/aseprite/skia/releases/download/m102-861e4743af/Skia-Windows-Release-x64.zip
+            unzip Skia-Windows-Release-x64.zip -d skia
+          elif [[ "${{ runner.os }}" == "macOS" ]] ; then
+            wget https://github.com/aseprite/skia/releases/download/m102-861e4743af/Skia-macOS-Release-arm64.zip
+            unzip Skia-macOS-Release-arm64.zip -d skia
+          else
+            wget https://github.com/aseprite/skia/releases/download/m102-861e4743af/Skia-Linux-Release-x64-libstdc++.zip
+            unzip Skia-Linux-Release-x64-libstdc++.zip -d skia
+          fi
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1
+        if: ${{ runner.os == 'Linux' || runner.os == 'macOS' }}
+        with:
+          key: ${{ matrix.os }}-${{ matrix.ui }}-${{ matrix.scripting }}-${{ matrix.build_type }}
+
+      - uses: aseprite/get-ninja@main
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+
+      # 改进后的 CMake 配置（来自第二个 Workflow）
+      - name: Generating Makefiles
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]] ; then
+            export enable_ccache=off
+          else
+            export enable_ccache=on
+          fi
+
+          export laf_backend=skia  # 强制使用 skia（来自第一个 Workflow 的需求）
+          export enable_scripting=on  # 强制启用脚本（来自第一个 Workflow 的需求）
+
+          if [[ "${{ runner.os }}" == "macOS" ]] ; then
+            export skia_arch=arm64
+          else
+            export skia_arch=x64
+          fi
+
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.9 \
+            -DENABLE_TESTS=ON \
+            -DENABLE_SCRIPTING=$enable_scripting \
+            -DENABLE_CCACHE=$enable_ccache \
+            -DLAF_BACKEND=$laf_backend \
+            -DSKIA_DIR=skia \
+            -DSKIA_LIBRARY_DIR=skia/out/Release-$skia_arch
+
+      - name: Compiling
+        shell: bash
+        run: |
+          cd build && ninja
+
+      # 以下测试步骤来自第二个 Workflow
+      - name: Running C++ Tests
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]] ; then
+            export XVFB=xvfb-run
+          fi
+          cd build && $XVFB ctest --output-on-failure
+
+      # 以下打包步骤来自第一个 Workflow（改进版）
+      - name: Package artifacts
+        shell: bash
+        run: |
+          mkdir -p package
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp build/bin/aseprite.exe package/Aseprite.exe
+            7z a -tzip Aseprite-${{ needs.check-version.outputs.latest_tag }}-${{ runner.os }}.zip package/*
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            mkdir -p Aseprite.app/Contents/{MacOS,Resources}
+            cp build/bin/aseprite Aseprite.app/Contents/MacOS/
+            cp -r data Aseprite.app/Contents/Resources/
+            zip -r Aseprite-${{ needs.check-version.outputs.latest_tag }}-macOS.zip Aseprite.app
+          else
+            cp build/bin/aseprite package/
+            cp -r data package/
+            tar czvf Aseprite-${{ needs.check-version.outputs.latest_tag }}-Linux.tar.gz package/*
+          fi
+
+      - name: Upload release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.check-version.outputs.upload_url }}
+          asset_path: aseprite/build/Aseprite-${{ needs.check-version.outputs.latest_tag }}-${{ runner.os }}.zip
+          asset_name: Aseprite-${{ needs.check-version.outputs.latest_tag }}-${{ runner.os }}.zip
+          asset_content_type: application/zip
